@@ -1,0 +1,123 @@
+# Tester-env build for evcc. Mirrors the upstream three-stage Dockerfile
+# (vite-plus UI -> golang:1.27.3-alpine -> alpine runtime) with the dependency
+# and GOROOT layers ordered for source-mutation rebuilds.
+#
+# Why the Go image is pinned to 1.27.3: `make patch-asn1` rewrites
+# $(GOROOT)/src/vendor/golang.org/x/crypto/cryptobyte/asn1.go, so a floating
+# golang:alpine tag (already 1.27.4+) would move the patched file. The patch
+# runs in its own layer right after go mod download so it is cached across
+# source mutations.
+#
+# Mutation costs (measured, see DEPLOY-SMA.md):
+#   - UI-only change under assets/: `make ui` re-runs (npm ci cached) then the
+#     Go asset/build layers re-run with a warm GOCACHE.
+#   - Go-only change: UI layer reused, `make assets` + `make build` re-run with
+#     warm GOCACHE/GOMODCACHE.
+#
+# .dockerignore excludes .git, so -buildvcs stays off and the version/commit
+# are injected from build args for reproducible image IDs.
+
+# STEP 1 build ui
+FROM --platform=$BUILDPLATFORM ghcr.io/voidzero-dev/vite-plus:1.4.0@sha256:5dfa2031f7d014b6376407fd99e0747bed329d792c79c184a65ec9a0765bee0e AS node
+
+USER root
+
+WORKDIR /build
+
+# install node tools
+COPY .node-version package*.json ./
+RUN --mount=type=cache,id=evcc-npm,target=/root/.npm npm ci
+
+# build ui
+COPY Makefile .
+COPY *.js ./
+COPY *.ts *.mts ./
+COPY .browserslistrc .
+COPY assets assets
+COPY i18n i18n
+
+RUN --mount=type=cache,id=evcc-npm,target=/root/.npm make ui
+
+
+# STEP 2 build executable binary
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine AS builder
+
+# Install git + SSL ca certificates.
+# Git is required for fetching the dependencies.
+# Ca-certificates is required to call HTTPS endpoints.
+RUN apk update && apk add --no-cache git make patch tzdata ca-certificates && update-ca-certificates
+
+# version metadata (no .git in the build context)
+ARG EVCC_VERSION=0.319.1-dev.tester-env
+ARG EVCC_SHA=29ef1eb4d0fff3186f6d9574496691b09cd6ae43
+
+WORKDIR /build
+
+# Setup Go cache
+ENV GOCACHE=/root/.cache/go-build
+ENV GOMODCACHE=/root/.cache/go-mod
+
+# download modules
+COPY go.mod .
+COPY go.sum .
+RUN --mount=type=cache,id=evcc-gomod,target=${GOMODCACHE} go mod download
+
+# install tools
+COPY Makefile .
+COPY cmd/implement/ cmd/implement/
+COPY api/ api/
+RUN --mount=type=cache,id=evcc-gomod,target=${GOMODCACHE} --mount=type=cache,id=evcc-gocache,target=${GOCACHE} make install
+
+# patch GOROOT vendored cryptobyte (needs only the patch file, cached)
+COPY packaging/patch/ packaging/patch/
+RUN make patch-asn1
+
+# prepare
+COPY . .
+RUN --mount=type=cache,id=evcc-gomod,target=${GOMODCACHE} --mount=type=cache,id=evcc-gocache,target=${GOCACHE} make assets
+
+# copy ui
+COPY --from=node /build/dist /build/dist
+
+# build
+RUN --mount=type=cache,id=evcc-gomod,target=${GOMODCACHE} --mount=type=cache,id=evcc-gocache,target=${GOCACHE} \
+    RELEASE=1 TAG_NAME=${EVCC_VERSION} SHA=${EVCC_SHA} make build
+
+
+# STEP 3 runtime
+FROM alpine:3.23@sha256:5b10f432ef3da1b8d4c7eb6c487f2f5a8f096bc91145e68878dd4a5019afde11
+
+LABEL org.opencontainers.image.documentation="https://docs.evcc.io"
+LABEL org.opencontainers.image.source="https://github.com/evcc-io/evcc"
+LABEL org.opencontainers.image.url="https://github.com/evcc-io/evcc"
+LABEL org.opencontainers.image.licenses="MIT"
+
+WORKDIR /app
+
+ENV TZ=Europe/Berlin
+
+# sqlite3 CLI: tester-env seed writes its fixtures into the mounted volume
+RUN apk add --no-cache sqlite
+
+# Import from builder
+COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=builder /build/evcc /usr/local/bin/evcc
+
+COPY packaging/docker/bin/* /app/
+
+# sqlite DSN + mounted tester-env.yaml live here
+RUN mkdir -p /data /config
+
+# UI and /api (pinned by tester-env.yaml `network.port`)
+EXPOSE 7070/tcp
+
+HEALTHCHECK \
+  --interval=10s \
+  --timeout=5s \
+  --start-period=30s \
+  --retries=6 \
+  CMD wget -qO /dev/null http://localhost:7070 || exit 1
+
+ENTRYPOINT [ "/app/entrypoint.sh" ]
+CMD [ "evcc" ]

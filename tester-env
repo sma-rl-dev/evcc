@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# evcc - Tester Environment CLI
+# Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+# Commands: deploy, seed, verify, reset, stop, logs, status, help
+#
+# Builds from editable source via Dockerfile.tester-env in this directory
+# (upstream three-stage vite-plus -> golang:1.27.3 -> alpine build), never
+# from a prebuilt image. The deterministic config is tester-env.yaml
+# (adapted from cmd/demo.yaml, Math.random/drift replaced by constants),
+# mounted read-only at /config/tester-env.yaml.
+#
+# Runtime: single container, sqlite at /data/evcc.db (named volume), auth and
+# onboarding disabled by flags, mDNS discovery off via EVCC_DISCOVERY_HOSTS=[].
+# Seed = tester-env-seed.py writes completed sessions plus the last week of
+# 15 minute energy/tariff history into that volume. Reset = remove the
+# container and the volume, so reset -> deploy -> seed is the reproducible path.
+
+RUN_ID="${RUN_ID:-default}"
+PORT="${PORT:-18070}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-evcc}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+CONFIG_FILE="${SCRIPT_DIR}/tester-env.yaml"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    CONTAINER_NAME="tester-env-evcc${suffix}"
+    DATA_VOLUME="evcc-data${suffix}"
+    # IMAGE_TAG set by scripts/rl-env to a content-addressed tag so identical
+    # (baseline, patch-set) combos share an image. Manual invocations get :dev.
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-evcc:dev}"
+}
+
+labels() {
+    echo --label "tester-env.project=${TESTER_ENV_PROJECT}"
+    echo --label "tester-env.app=${TESTER_ENV_APP}"
+    echo --label "tester-env.scenario=${TESTER_ENV_SCENARIO}"
+}
+
+api_state() {
+    curl -fs "http://localhost:${PORT}/api/state"
+}
+
+cmd_deploy() {
+    echo "==> Resetting any previous run (${RUN_ID})..."
+    cmd_reset_inner
+
+    echo "==> Building image from source (${IMAGE_NAME})..."
+    docker build \
+        $(labels) \
+        -f "${SCRIPT_DIR}/Dockerfile.tester-env" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    echo "==> Creating volume ${DATA_VOLUME} (reuse if present)..."
+    docker volume inspect "${DATA_VOLUME}" >/dev/null 2>&1 || docker volume create \
+        $(labels) "${DATA_VOLUME}" >/dev/null
+
+    echo "==> Starting evcc on port ${PORT}..."
+    docker run -d --name "${CONTAINER_NAME}" \
+        $(labels) \
+        -p "${PORT}:7070" \
+        -v "${CONFIG_FILE}:/config/tester-env.yaml:ro" \
+        -v "${DATA_VOLUME}:/data" \
+        -e EVCC_DATABASE_DSN=/data/evcc.db \
+        -e EVCC_DISCOVERY_HOSTS='[]' \
+        "${IMAGE_NAME}" \
+        evcc --config /config/tester-env.yaml --disable-auth --disable-onboarding >/dev/null
+
+    echo "==> Waiting for evcc (apiReady)..."
+    local i
+    for i in $(seq 1 60); do
+        if api_state 2>/dev/null | grep -q '"apiReady":true'; then
+            echo "==> Deployment complete. App running at http://localhost:${PORT}"
+            return 0
+        fi
+        if ! docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "ERROR: container exited during startup."
+            docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+            exit 1
+        fi
+        sleep 2
+    done
+
+    echo "ERROR: evcc did not become ready in time."
+    docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+    exit 1
+}
+
+cmd_seed() {
+    # tester-env.yaml is the device/site seed. The database holds what a config
+    # cannot express: completed charging sessions and the last week of 15 minute
+    # energy/tariff history. tester-env-seed.py derives both from the local
+    # (Europe/Berlin) date, so reset -> deploy -> seed returns the same state.
+    [[ -f "${CONFIG_FILE}" ]] || { echo "ERROR: tester-env.yaml missing."; exit 1; }
+    [[ -f "${SCRIPT_DIR}/tester-env-seed.py" ]] || { echo "ERROR: tester-env-seed.py missing."; exit 1; }
+    docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$" \
+        || { echo "ERROR: container ${CONTAINER_NAME} is not running. Run 'deploy' first."; exit 1; }
+
+    echo "==> Seeding sqlite (/data/evcc.db): sessions, last 7 days energy + tariffs..."
+    python3 "${SCRIPT_DIR}/tester-env-seed.py" sql \
+        | docker exec -i "${CONTAINER_NAME}" sqlite3 -bail -cmd ".timeout 5000" "/data/evcc.db" \
+        || { echo "ERROR: seeding failed."; exit 1; }
+
+    local sessions
+    sessions="$(docker exec "${CONTAINER_NAME}" sqlite3 "/data/evcc.db" \
+        "SELECT COUNT(*) FROM sessions WHERE charged_kwh >= 0.05;")"
+    echo "==> Seed complete: ${sessions} completed charging sessions, 7 days of history."
+}
+
+cmd_verify() {
+    echo "==> Verifying seeded state..."
+    [[ -f "${CONFIG_FILE}" ]] || { echo "ERROR: tester-env.yaml missing."; exit 1; }
+
+    local state
+    state="$(api_state)" || { echo "ERROR: /api/state not reachable."; exit 1; }
+
+    echo "${state}" | jq -e '.apiReady == true' >/dev/null \
+        || { echo "ERROR: apiReady is not true."; exit 1; }
+    echo "${state}" | jq -e '.siteTitle == "Home Energy"' >/dev/null \
+        || { echo "ERROR: unexpected site title."; exit 1; }
+    echo "${state}" | jq -e '(.loadpoints | length) == 3' >/dev/null \
+        || { echo "ERROR: expected 3 loadpoints."; exit 1; }
+    echo "${state}" | jq -e '.pvPower > 0 and .homePower != null and .grid.power != null' >/dev/null \
+        || { echo "ERROR: energy flow values missing."; exit 1; }
+
+    curl -fs "http://localhost:${PORT}/" | grep -qi '<!doctype html' \
+        || { echo "ERROR: UI index not reachable."; exit 1; }
+
+    # Sessions, per-month filters and energy history must match the seed exactly.
+    python3 "${SCRIPT_DIR}/tester-env-seed.py" check --base-url "http://localhost:${PORT}" \
+        || { echo "ERROR: seeded state does not match."; exit 1; }
+
+    echo "==> Verification complete: apiReady, site title, 3 loadpoints, energy flow, UI reachable, sessions + energy history match the seed."
+}
+
+cmd_reset_inner() {
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume rm "${DATA_VOLUME}" >/dev/null 2>&1 || true
+}
+
+cmd_reset() {
+    echo "==> Resetting environment (container + sqlite volume: clean slate)..."
+    cmd_reset_inner
+    echo "==> Reset complete. Run 'deploy' to start fresh."
+}
+
+cmd_stop() {
+    echo "==> Stopping container (sqlite volume preserved)..."
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || echo "==> Container not running."
+    echo "==> Stopped."
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}" 2>/dev/null || echo "Container not running."
+}
+
+cmd_status() {
+    if docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Image: $(docker inspect -f '{{.Config.Image}}' "${CONTAINER_NAME}")"
+        echo "Data volume: ${DATA_VOLUME} (sqlite: /data/evcc.db)"
+    else
+        echo "Status: NOT RUNNING"
+        echo "Container: ${CONTAINER_NAME}"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+evcc - Tester Environment CLI
+
+Usage: ./tester-env <command> [--run-id <id>] [--port <port>]
+
+Commands:
+  deploy    Build image from source, start evcc (fresh sqlite volume)
+  seed      Write deterministic charging sessions and a week of energy history
+  verify    Assert apiReady, site title, loadpoints, sessions, energy history
+  reset     Stop/remove container and sqlite volume (keeps image)
+  stop      Stop container (keeps sqlite volume)
+  logs      Tail evcc container logs
+  status    Show container status and URL
+  help      Show this help message
+
+Options:
+  --run-id <id>     Isolate container/volume names for parallel runs.
+                    Default: default (or \$RUN_ID)
+  --port <port>     Host port mapped to container 7070.
+                    Default: 18070 (or \$PORT)
+
+Credentials: none (auth disabled with --disable-auth)
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    shift || true
+
+    while [[ $# -gt 0 ]]; do
+        case "${1}" in
+            --run-id) RUN_ID="${2:?--run-id requires a value}"; shift 2 ;;
+            --port) PORT="${2:?--port requires a value}"; shift 2 ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Error: unknown argument '${1}'"; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+
+    case "${cmd}" in
+        deploy) cmd_deploy ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Error: unknown command '${cmd}'"; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"

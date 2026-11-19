@@ -1,0 +1,291 @@
+# Deterministic tester environment for evcc.
+#
+# Adapted from upstream cmd/demo.yaml. Differences: the three Math.random()
+# expressions are constants, and the battery SoC / heat pump temperature /
+# vehicle SoC drift loops are removed, so every poll returns the same values.
+# Charger and heat pump setters still mutate shared state, so UI actions
+# (mode, max current, enable, heat pump mode) change what the dashboard shows.
+#
+# Run with: evcc --config /config/tester-env.yaml --disable-auth --disable-onboarding
+# (auth and the onboarding wizard are disabled for deterministic access).
+
+network:
+  port: 7070
+
+log: info
+
+interval: 3s
+
+javascript:
+  - vm: shared
+    script: |
+      state = {
+        residualpower: 500,
+        pvpower: 8000,
+        batterypower: -750,
+        batterySoc: 55,
+        gridpower: -7500,
+        loadpoints: [
+          { enabled: true, vehicleSoc: 62, maxcurrent: 6, phases: 1, chargepower: 0 },
+          { enabled: false, vehicleSoc: 22, maxcurrent: 0, phases: 3, chargepower: 0 }
+        ],
+        heatpump: { mode: 2, power: 300, temp: 48 }
+      };
+      function logState() {
+        console.log("state:", JSON.stringify(state));
+      }
+
+meters:
+  - name: grid
+    type: custom
+    power:
+      source: js
+      vm: shared
+      script: |
+        state.gridpower = state.loadpoints[0].chargepower + state.loadpoints[1].chargepower + state.heatpump.power + state.residualpower - state.batterypower - state.pvpower;
+        state.gridpower;
+
+  - name: pv
+    type: custom
+    power:
+      source: js
+      vm: shared
+      script: state.pvpower;
+
+  - name: battery
+    type: custom
+    power:
+      source: js
+      vm: shared
+      script: state.batterypower;
+    soc:
+      source: js
+      vm: shared
+      script: state.batterySoc;
+    capacity: 13.4
+    batterymodes: ["normal", "hold", "charge", "holdcharge"]
+    batterymode:
+      source: js
+      vm: shared
+      script: |
+        1
+
+  - name: meter_charger_1
+    type: custom
+    power:
+      source: js
+      vm: shared
+      script: state.loadpoints[0].chargepower;
+
+  - name: meter_charger_2
+    type: custom
+    power:
+      source: js
+      vm: shared
+      script: state.loadpoints[1].chargepower;
+
+chargers:
+  - name: charger_1
+    type: custom
+    enable:
+      source: js
+      vm: shared
+      script: |
+        logState();
+        var lp = state.loadpoints[0];
+        lp.enabled = enable;
+        enable;
+      out:
+        - name: enable
+          type: bool
+          config:
+            source: js
+            vm: shared
+            script: |
+              if (enable) lp.chargepower = lp.maxcurrent * 230 * lp.phases; else lp.chargepower = 0;
+    enabled:
+      source: js
+      vm: shared
+      script: |
+        state.loadpoints[0].enabled;
+    status:
+      source: js
+      vm: shared
+      script: |
+        if (state.loadpoints[0].enabled) "C"; else "B";
+    maxcurrent:
+      source: js
+      vm: shared
+      script: |
+        logState();
+        var lp = state.loadpoints[0];
+        lp.maxcurrent = maxcurrent;
+        if (lp.enabled) lp.chargepower = lp.maxcurrent * 230 * lp.phases; else lp.chargepower = 0;
+
+  - name: charger_2
+    type: custom
+    enable:
+      source: js
+      vm: shared
+      script: |
+        logState();
+        var lp = state.loadpoints[1];
+        lp.enabled = enable;
+        if (lp.enabled) lp.chargepower = lp.maxcurrent * 230 * lp.phases; else lp.chargepower = 0;
+    enabled:
+      source: js
+      vm: shared
+      script: |
+        state.loadpoints[1].enabled;
+    status:
+      source: js
+      vm: shared
+      script: |
+        if (state.loadpoints[1].enabled) "C"; else "B";
+    maxcurrent:
+      source: js
+      vm: shared
+      script: |
+        logState();
+        var lp = state.loadpoints[1];
+        lp.maxcurrent = maxcurrent;
+        if (lp.enabled) lp.chargepower = lp.maxcurrent * 230 * lp.phases; else lp.chargepower = 0;
+    tos: true
+    phases1p3p:
+      source: js
+      vm: shared
+      script: |
+        logState();
+        if (phases === 1) lp.phases = 1; else lp.phases = 3;
+        lp.phases;
+
+  - name: charger_3
+    type: sgready
+    features: [heating, integrateddevice, continuous, switchdevice]
+    setmode:
+      source: js
+      vm: shared
+      script: |
+        state.heatpump.mode = mode;
+        mode;
+    getmode:
+      source: js
+      vm: shared
+      script: state.heatpump.mode;
+    power:
+      source: js
+      vm: shared
+      script: |
+        var hp = state.heatpump;
+        hp.power = hp.mode === 3 ? 3800 : 300;
+        hp.power;
+    temp:
+      source: js
+      vm: shared
+      script: |
+        state.heatpump.temp;
+    limittemp:
+      source: const
+      value: 65
+
+vehicles:
+  - name: vehicle_1
+    title: blue e-Golf
+    type: custom
+    soc:
+      source: js
+      vm: shared
+      script: |
+        state.loadpoints[0].vehicleSoc;
+    range:
+      source: js
+      vm: shared
+      script: |
+        var lp = state.loadpoints[0]
+        var range = (44 * lp.vehicleSoc) / 15;
+        range
+    capacity: 44
+  - name: vehicle_2
+    title: white Model 3
+    type: custom
+    soc:
+      source: js
+      vm: shared
+      script: |
+        state.loadpoints[1].vehicleSoc;
+    range:
+      source: js
+      vm: shared
+      script: |
+        var lp = state.loadpoints[1]
+        var range = (80 * lp.vehicleSoc) / 17;
+        range
+    status:
+      source: js
+      vm: shared
+      script: |
+        "B"
+    capacity: 80
+    limitsoc:
+      source: const
+      value: 90
+  - name: vehicle_3
+    type: template
+    template: offline
+    title: green Honda e
+    capacity: 8
+  - name: vehicle_4
+    type: template
+    template: offline
+    title: black VanMoof
+    icon: bike
+    capacity: 0.46
+
+site:
+  title: Home Energy
+  meters:
+    grid: grid
+    pv: pv
+    battery: battery
+
+loadpoints:
+  - title: Carport
+    charger: charger_1
+    mode: pv
+    meter: meter_charger_1
+    vehicle: vehicle_1
+  - title: Garage
+    charger: charger_2
+    mode: "off"
+    meter: meter_charger_2
+    vehicle: vehicle_2
+  - title: Heat pump
+    charger: charger_3
+    mode: pv
+    ui:
+      minTemp: 30
+      maxTemp: 70
+
+tariffs:
+  currency: EUR # three letter ISO-4217 currency code (default EUR)
+  grid:
+    type: template
+    template: demo-dynamic-grid
+    min: 0.18
+    max: 0.41
+  feedin:
+    type: fixed
+    price: 0.08 # EUR/kWh
+  solar:
+    type: template
+    template: demo-solar-forecast
+    kwp: 15.5
+    sunrise: 7
+    sunset: 17
+  co2:
+    type: template
+    template: demo-co2-forecast
+    base: 350
+  temperature:
+    type: template
+    template: demo-temperature-forecast

@@ -30,3 +30,4 @@ test-results
 !entrypoint.sh
 !evcc.dist.yaml
 !package*.json
+.git
