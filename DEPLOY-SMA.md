@@ -148,3 +148,34 @@ re-executed when the Go base image changes.
 - `seed` and `verify` need `python3` on the host (stdlib only, same as the
   Solectrus seed script).
 - OCPP/EEBus listeners still bind inside the container; they are not published.
+
+## Fork baseline and verification
+
+- Canonical fork: <https://github.com/sma-rl-dev/evcc>, created with
+  `gh repo fork https://github.com/evcc-io/evcc --org sma-rl-dev --remote=false`
+  (isFork, parent `evcc-io/evcc`; no personal-namespace fork exists or is used).
+- Branch `tester-env/baseline` = upstream tag `0.319.1`
+  (`29ef1eb4d0fff3186f6d9574496691b09cd6ae43`) + tooling commit
+  `5e488316acb9efb857ef2297b66027e5c98fd286` (Dockerfile.tester-env, tester-env,
+  tester-env.yaml, tester-env-seed.py, DEPLOY-SMA.md, .dockerignore/.gitignore).
+- Corpus submodule `apps/evcc` tracks this fork and pins an immutable commit;
+  `app_cli = "tester-env"` is submodule-relative and all deployment tooling lives
+  inside the fork.
+
+Fresh-checkout gate (2026-11-19, from `apps/evcc`):
+
+```bash
+IMAGE_TAG=tester-env-evcc:integrator-check ./tester-env deploy --run-id integrator --port 18071
+./tester-env seed   --run-id integrator --port 18071   # 14 sessions, 7 days history
+./tester-env verify --run-id integrator --port 18071   # PASS, seed re-checked
+./tester-env reset  --run-id integrator                # only its container + volume
+```
+
+`deploy` rebuilt from editable source (warm cache), became healthy, and
+`seed`/`verify` passed. `reset` removed only `tester-env-evcc-integrator` and
+`evcc-data-integrator` and kept the image (content-addressed `IMAGE_TAG`).
+
+Browser evidence (browser-checker 2026-11-19, recorded here as supplied by the
+orchestrator; the fork integrator ran no browser): dashboard, Sessions
+November/September/Total periods and the Energy day view for 18 Nov are visible
+after `reset -> deploy -> seed`.
