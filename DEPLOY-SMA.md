@@ -7,7 +7,7 @@ built from this checkout by `tester-env`, never from a prebuilt image.
 
 ```bash
 ./tester-env deploy    # build image, start container with a fresh sqlite volume
-./tester-env seed      # write sessions + energy history into that volume
+./tester-env seed      # write the Heat pump loadpoint, sessions + energy history
 ./tester-env verify    # assert apiReady, site, loadpoints, sessions, energy history
 ./tester-env status    # container state + URL
 ./tester-env logs      # tail evcc logs
@@ -54,7 +54,38 @@ move with the wall clock, as in other accepted energy apps.
 
 `./tester-env seed` pipes the SQL from `tester-env-seed.py` into
 `sqlite3 /data/evcc.db` inside the running container (the runtime image ships
-`sqlite3`). Only two things are written; everything else comes from the config.
+`sqlite3`). It writes three things; everything else comes from the config.
+
+### Heat pump loadpoint (database configuration)
+
+`tester-env.yaml` defines only Carport and Garage. The third loadpoint, **Heat
+pump**, is written by the seed as a `configs`-table row (class 5, id 1):
+
+```json
+{"charger":"charger_3","defaultMode":"pv","title":"Heat pump","ui":{"minTemp":30,"maxTemp":70}}
+```
+
+- It references the yaml `sgready` charger `charger_3` by name, so the charger
+  keeps its custom JS plugin; only the loadpoint moves into the database.
+- A yaml loadpoint is a static device with no database id, so
+  `assets/js/views/Config.vue` (`editable: !!loadpoint.id`) offers no edit
+  control and `PUT /api/config/loadpoints/{id}` rejects it. The db row gives the
+  Configuration view an editable Heat pump entry (`/api/config/loadpoints`
+  returns `{"id":1,"name":"db:1"}`, `GET /api/config/loadpoints/1` is the edit
+  dialog payload).
+- `ui.minTemp 30` / `ui.maxTemp 70` makes the dashboard settings dialog's
+  "Min. temperature" select span 30-70 °C. `minSoc` (that select's stored value
+  for heating chargers) is deliberately absent, so the dialog starts on `---`
+  and shows the `minimum x °C` placeholder. Save-unchanged from the edit dialog
+  (`PUT` with the `GET` body) returns 200 and leaves the row intact.
+
+**Reload mechanism.** evcc reads `configs` rows only at boot; there is no config
+hot-reload. `seed` therefore writes the SQL and then `docker restart`s the same
+container (the `evcc-data` volume and its rows persist) and waits for
+`/api/state` `apiReady` again. This keeps `reset -> deploy -> seed` a single
+deterministic sequence with no pre-boot schema provisioning and no manual step.
+Seeded history stops at the current slot boundary, so the restart only adds
+evcc's own later slots; it never overwrites the seed.
 
 Completed charging sessions, ids 101-114, three vehicles and two charging points:
 
@@ -88,11 +119,17 @@ Stable assertions after `reset -> deploy -> seed`:
 - `/api/sessions` returns 14 sessions with those vehicles, loadpoints, kWh and
   costs; the API month filter returns 5 for each of the two older months.
 - November (current month) initially shows 4 sessions, 49.4 kWh, 8.16 €.
+- `/api/state` has 3 loadpoints, exactly one titled `Heat pump`: heating charger
+  feature, `ui` 30/70, `minSoc` 0; `/api/config/loadpoints` lists it as
+  `db:1` with `id` 1 and the same values.
 - `/api/history/energy?aggregate=day` returns 7 day buckets for home/grid/pv/
   battery: pv 203.454 kWh, home 123.896 kWh, grid import 41.501 kWh, battery
   charge 120.303 kWh, with grid cost > 0 from the tariff join.
 - `verify` recomputes those numbers from the same generator, so a schema or
   format drift fails the CLI instead of silently producing empty charts.
+
+The current-month figures depend on the local day/time: a fixed-day session
+whose hour has not come yet is skipped, so the seed never writes future rows.
 
 `verify` assumes it runs in the same local (Europe/Berlin) day as `seed`:
 session days and the history window are anchored to that date. `rl-env` and
@@ -147,6 +184,8 @@ re-executed when the Go base image changes.
   can write into the volume; the layer is cached, so rebuilds stay fast.
 - `seed` and `verify` need `python3` on the host (stdlib only, same as the
   Solectrus seed script).
+- `seed` restarts the running container once (configs rows are boot-only), which
+  costs a few seconds; `deploy` is unaffected.
 - OCPP/EEBus listeners still bind inside the container; they are not published.
 
 ## Fork baseline and verification

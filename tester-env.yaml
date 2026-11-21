@@ -259,12 +259,11 @@ loadpoints:
     mode: "off"
     meter: meter_charger_2
     vehicle: vehicle_2
-  - title: Heat pump
-    charger: charger_3
-    mode: pv
-    ui:
-      minTemp: 30
-      maxTemp: 70
+  # The Heat pump loadpoint is deliberately NOT defined here. A yaml loadpoint
+  # is a static device without a database id, so the Configuration view cannot
+  # edit it. tester-env-seed.py writes it as a configs-table row referencing
+  # charger_3 (ui.minTemp 30 / ui.maxTemp 70) and `tester-env seed` restarts
+  # evcc so the row is loaded.
 
 tariffs:
   currency: EUR # three letter ISO-4217 currency code (default EUR)

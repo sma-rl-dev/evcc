@@ -2,8 +2,9 @@
 """Deterministic seed and check for the evcc tester environment.
 
 tester-env.yaml supplies site, meters, chargers, vehicles, loadpoints and
-tariffs. This script adds what a YAML config cannot: completed charging
-sessions and the 15 minute energy/tariff history of the previous week.
+tariffs. This script adds what a YAML config cannot: a database-configurable
+loadpoint (needed for the Configuration view), completed charging sessions and
+the 15 minute energy/tariff history of the previous week.
 
   tester-env-seed.py sql                    print the seed SQL (stdout)
   tester-env-seed.py check --base-url URL   assert the seeded state via /api
@@ -40,6 +41,20 @@ SESSIONS = [
 # Ids live above evcc's own rows (open sessions get autoincrement ids 1, 2, ...)
 FIRST_SESSION_ID = 101
 
+# Heat pump loadpoint as a configs-table row (class 5 = templates.Loadpoint).
+# A yaml loadpoint is a static device without an id, so it cannot be opened and
+# saved in the Configuration view; a db loadpoint can. minSoc (the dashboard
+# "Min. temperature" for heating chargers) is absent on purpose: the settings
+# dialog then shows "---"/x °C. The charger stays in tester-env.yaml and is
+# referenced by name.
+LOADPOINT_CONFIG_ID = 1
+LOADPOINT_CONFIG = {
+    "charger": "charger_3",
+    "title": "Heat pump",
+    "defaultMode": "pv",
+    "ui": {"minTemp": 30, "maxTemp": 70},
+}
+
 
 def local_now():
     return datetime.now(TZ)
@@ -71,7 +86,8 @@ def expected_sessions(now=None):
         year, month = month_shift(today, offset)
         for day, start, minutes, loadpoint, vehicle, kwh, soc_start, soc_end, odometer, solar, ppk, added_range in SESSIONS:
             created = datetime(year, month, day, start[0], start[1], tzinfo=TZ)
-            if created.date() > today:
+            # never future-dated: same-day sessions whose hour has not come yet are skipped
+            if created > now:
                 continue
             rows.append((next_id, created, minutes, loadpoint, vehicle, kwh, soc_start, soc_end, odometer, solar, ppk, added_range))
             next_id += 1
@@ -302,6 +318,18 @@ def history_sql(now=None):
     return out
 
 
+def loadpoint_config_sql():
+    """Replace all db loadpoints with the single fixed Heat pump row."""
+    value = json.dumps(LOADPOINT_CONFIG, sort_keys=True, separators=(",", ":"))
+    return [
+        "BEGIN;",
+        "DELETE FROM configs WHERE class = 5;",
+        "INSERT INTO configs (id, class, type, disable, title, icon, product, value)"
+        " VALUES (%d, 5, '', 0, '', '', '', '%s');" % (LOADPOINT_CONFIG_ID, value.replace("'", "''")),
+        "COMMIT;",
+    ]
+
+
 def get_json(base_url, path):
     with urllib.request.urlopen(base_url.rstrip("/") + path, timeout=30) as response:
         return json.load(response)
@@ -319,8 +347,36 @@ def check(base_url):
         fail("apiReady is not true")
     if state.get("siteTitle") != "Home Energy":
         fail("site title is not 'Home Energy'")
-    if len(state.get("loadpoints", [])) != 3:
+    lps = state.get("loadpoints", [])
+    if len(lps) != 3:
         fail("expected 3 loadpoints")
+
+    # Heat pump: exactly one, heating charger, fixed temperature range, unset min
+    heat = [lp for lp in lps if lp.get("title") == "Heat pump"]
+    if len(heat) != 1:
+        fail("expected exactly 1 loadpoint titled 'Heat pump', got %d" % len(heat))
+    else:
+        lp = heat[0]
+        if not lp.get("chargerFeatureHeating"):
+            fail("Heat pump is not driven by a heating charger")
+        if lp.get("ui") != {"minTemp": 30, "maxTemp": 70}:
+            fail("Heat pump ui: expected minTemp 30 / maxTemp 70, got %r" % (lp.get("ui"),))
+        if lp.get("minSoc"):
+            fail("Heat pump minimum temperature: expected unset, got %r" % lp.get("minSoc"))
+
+    # Heat pump must be database-configurable so the Configuration view can edit it
+    db_name = "db:%d" % LOADPOINT_CONFIG_ID
+    if not any(c.get("name") == db_name for c in get_json(base_url, "/api/config/loadpoints")):
+        fail("loadpoint config %s missing from /api/config/loadpoints" % db_name)
+    else:
+        row = get_json(base_url, "/api/config/loadpoints/%d" % LOADPOINT_CONFIG_ID)
+        for field, want in (("id", LOADPOINT_CONFIG_ID), ("title", "Heat pump"), ("charger", "charger_3")):
+            if row.get(field) != want:
+                fail("loadpoint config %s: expected %r, got %r" % (field, want, row.get(field)))
+        if row.get("minSoc"):
+            fail("loadpoint config minSoc: expected unset, got %r" % row.get("minSoc"))
+        if row.get("ui") != {"minTemp": 30, "maxTemp": 70}:
+            fail("loadpoint config ui: expected minTemp 30 / maxTemp 70, got %r" % (row.get("ui"),))
 
     sessions = get_json(base_url, "/api/sessions")
     expected = expected_sessions(now)
@@ -427,6 +483,8 @@ def main():
     args = parser.parse_args()
 
     if args.command == "sql":
+        for line in loadpoint_config_sql():
+            print(line)
         for line in sessions_sql():
             print(line)
         for line in history_sql():

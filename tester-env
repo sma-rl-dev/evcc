@@ -13,9 +13,11 @@ set -euo pipefail
 #
 # Runtime: single container, sqlite at /data/evcc.db (named volume), auth and
 # onboarding disabled by flags, mDNS discovery off via EVCC_DISCOVERY_HOSTS=[].
-# Seed = tester-env-seed.py writes completed sessions plus the last week of
-# 15 minute energy/tariff history into that volume. Reset = remove the
-# container and the volume, so reset -> deploy -> seed is the reproducible path.
+# Seed = tester-env-seed.py writes the database-only state (the Heat pump
+# loadpoint as an editable configs row, completed sessions, last week of 15
+# minute energy/tariff history) into that volume and restarts evcc, because
+# configs rows are read at boot only. Reset = remove the container and the
+# volume, so reset -> deploy -> seed is the reproducible path.
 
 RUN_ID="${RUN_ID:-default}"
 PORT="${PORT:-18070}"
@@ -48,6 +50,25 @@ api_state() {
     curl -fs "http://localhost:${PORT}/api/state"
 }
 
+wait_api_ready() {
+    local i
+    for i in $(seq 1 60); do
+        if api_state 2>/dev/null | grep -q '"apiReady":true'; then
+            return 0
+        fi
+        if ! docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
+            echo "ERROR: container exited during startup."
+            docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+            exit 1
+        fi
+        sleep 2
+    done
+
+    echo "ERROR: evcc did not become ready in time."
+    docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
+    exit 1
+}
+
 cmd_deploy() {
     echo "==> Resetting any previous run (${RUN_ID})..."
     cmd_reset_inner
@@ -75,39 +96,31 @@ cmd_deploy() {
         evcc --config /config/tester-env.yaml --disable-auth --disable-onboarding >/dev/null
 
     echo "==> Waiting for evcc (apiReady)..."
-    local i
-    for i in $(seq 1 60); do
-        if api_state 2>/dev/null | grep -q '"apiReady":true'; then
-            echo "==> Deployment complete. App running at http://localhost:${PORT}"
-            return 0
-        fi
-        if ! docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$"; then
-            echo "ERROR: container exited during startup."
-            docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
-            exit 1
-        fi
-        sleep 2
-    done
-
-    echo "ERROR: evcc did not become ready in time."
-    docker logs "${CONTAINER_NAME}" 2>&1 | tail -40 || true
-    exit 1
+    wait_api_ready
+    echo "==> Deployment complete. App running at http://localhost:${PORT}"
 }
 
 cmd_seed() {
     # tester-env.yaml is the device/site seed. The database holds what a config
-    # cannot express: completed charging sessions and the last week of 15 minute
-    # energy/tariff history. tester-env-seed.py derives both from the local
+    # cannot express: the Heat pump loadpoint as an editable configs row,
+    # completed charging sessions and the last week of 15 minute
+    # energy/tariff history. tester-env-seed.py derives all of it from the local
     # (Europe/Berlin) date, so reset -> deploy -> seed returns the same state.
     [[ -f "${CONFIG_FILE}" ]] || { echo "ERROR: tester-env.yaml missing."; exit 1; }
     [[ -f "${SCRIPT_DIR}/tester-env-seed.py" ]] || { echo "ERROR: tester-env-seed.py missing."; exit 1; }
     docker ps --filter "name=${CONTAINER_NAME}" --format '{{.Names}}' | grep -q "^${CONTAINER_NAME}$" \
         || { echo "ERROR: container ${CONTAINER_NAME} is not running. Run 'deploy' first."; exit 1; }
 
-    echo "==> Seeding sqlite (/data/evcc.db): sessions, last 7 days energy + tariffs..."
+    echo "==> Seeding sqlite (/data/evcc.db): Heat pump loadpoint, sessions, last 7 days energy + tariffs..."
     python3 "${SCRIPT_DIR}/tester-env-seed.py" sql \
         | docker exec -i "${CONTAINER_NAME}" sqlite3 -bail -cmd ".timeout 5000" "/data/evcc.db" \
         || { echo "ERROR: seeding failed."; exit 1; }
+
+    # evcc has no config hot-reload: configs rows are read at boot only. Restart
+    # the container so the seeded loadpoint exists; the volume persists.
+    echo "==> Restarting evcc to load the seeded loadpoint..."
+    docker restart "${CONTAINER_NAME}" >/dev/null
+    wait_api_ready
 
     local sessions
     sessions="$(docker exec "${CONTAINER_NAME}" sqlite3 "/data/evcc.db" \
@@ -138,7 +151,7 @@ cmd_verify() {
     python3 "${SCRIPT_DIR}/tester-env-seed.py" check --base-url "http://localhost:${PORT}" \
         || { echo "ERROR: seeded state does not match."; exit 1; }
 
-    echo "==> Verification complete: apiReady, site title, 3 loadpoints, energy flow, UI reachable, sessions + energy history match the seed."
+    echo "==> Verification complete: apiReady, site title, 3 loadpoints, Heat pump db config, energy flow, UI reachable, sessions + energy history match the seed."
 }
 
 cmd_reset_inner() {
